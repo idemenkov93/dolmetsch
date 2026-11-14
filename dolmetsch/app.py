@@ -49,9 +49,9 @@ def status_text(running: bool, source: str, status: str, profile: str, engine: s
         return "Пауза", "warn"
     if status != "ok":
         return STATUS.get(status, ("Ищу встречу…", "warn"))
-    parts = [source, f"профиль «{PROFILE_NAMES.get(profile, profile)}»"]
+    parts = [source, PROFILE_NAMES.get(profile, profile)]
     if engine:
-        parts.append(f"{engine}, {ms / 1000:.1f} с".replace(".", ","))
+        parts.append(f"{engine} {ms / 1000:.1f} с".replace(".", ","))
     if error:
         parts.append(error)
     return " · ".join(parts), ("warn" if error else "ok")
@@ -60,18 +60,21 @@ def status_text(running: bool, source: str, status: str, profile: str, engine: s
 def make_controller():
     """Собирает приложение. Qt подключается здесь, чтобы служебные режимы работали и без него."""
     from PySide6.QtCore import QObject, QTimer, QUrl, Signal
-    from PySide6.QtGui import QAction, QActionGroup, QCursor, QDesktopServices
-    from PySide6.QtWidgets import QApplication, QInputDialog, QLineEdit, QMenu, QSystemTrayIcon
+    from PySide6.QtGui import QAction, QActionGroup, QDesktopServices
+    from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon
 
+    from . import shared
     from .capture.selector import CaptureLoop, Selector
     from .capture.teams import TeamsSource
     from .capture.wincaptions import WindowsCaptionsSource
-    from .hotkeys import Hotkeys
+    from .glossary import Glossary
+    from .hotkeys import Hotkeys, parse
     from .pipeline import Pipeline
-    from .transcript import Transcript, documents_dir, lessons_root
-    from .ui import style
-    from .ui.overlay import Overlay, set_capture_hidden
-    from .ui.prompt import AskBar
+    from .transcript import Transcript
+    from .ui.family import icons, tokens, win
+    from .ui.overlay import Overlay
+    from .ui.prompt import AskCard
+    from .ui.settings import Settings
 
     class Bridge(QObject):
         """Сигналы из фоновых потоков в окно (Qt сам переносит их в главный поток)."""
@@ -88,142 +91,176 @@ def make_controller():
         def __init__(self, use_hotkeys: bool = True):
             self.cfg = Config()
             self.hw = hardware.detect()
+            shared.ensure()
             self.offline = OpusMTTranslator(device=self.cfg["device"], threads=self.cfg["threads"])
             self.online = DeepLTranslator(get_deepl_key)
             self.router = Router(self.offline, self.online, self.cfg["profile"], self.cfg["lesson_hours"],
                                  state=self.cfg["deepl"])
             self.transcript = Transcript()
+            self.glossary = Glossary()
+            self.glossary.load()
             self.running = False
-            self.pipeline = self.capture = None
+            self.pipeline = self.capture = self.settings = None
             self.source, self.status, self.engine, self.ms = "", "no_window", "", 0
+            self.use_hotkeys, self.hotkeys = use_hotkeys, None
 
             self.bridge = Bridge()
-            self.overlay = Overlay(self.cfg["font_size"], self.cfg["opacity"], self.cfg["lines"],
-                                   self.cfg["show_original"], self.cfg["window"])
-            self.askbar = AskBar()
-            b = self.bridge
+            self.overlay = Overlay(self.cfg["text_px"], self.cfg["opacity"], self.cfg["show_original"], self.cfg["window"])
+            self.askcard = AskCard()
+            b, o = self.bridge, self.overlay
             b.line.connect(self.on_line)
-            b.partial.connect(self.overlay.set_partial)
-            b.draft.connect(self.overlay.set_draft)
+            b.partial.connect(o.set_partial)
+            b.draft.connect(o.set_draft)
             b.state.connect(self.on_state)
             b.ask.connect(self.on_ask)
             b.hotkey.connect(self.on_hotkey)
-            b.notice.connect(self.overlay.flash)
+            b.notice.connect(o.flash)
             b.model.connect(self.on_model)
-            self.askbar.answered.connect(self.on_answer)
-            self.askbar.how.connect(lambda: self.overlay.flash(HOW_TEAMS, 20))
-            self.overlay.menu_requested.connect(lambda pos: self.menu.popup(pos))
-            self.overlay.geometry_changed.connect(lambda g: self.cfg.set("window", g))
+            self.askcard.answered.connect(self.on_answer)
+            self.askcard.how.connect(lambda: o.flash(HOW_TEAMS, 20))
+            o.menu_requested.connect(lambda pos: self.menu.popup(pos))
+            o.geometry_changed.connect(lambda g: self.cfg.set("window", g))
+            o.pause_clicked.connect(self.toggle)
+            o.settings_clicked.connect(self.open_settings)
+            o.size_step.connect(lambda step: self.cfg.set("text_px", o.step_size(step)))
+            o.hide_clicked.connect(self.toggle_window)
 
             self.menu = QMenu()
             self.build_menu(QAction, QActionGroup)
             self.tray = None
             if QSystemTrayIcon.isSystemTrayAvailable():
-                self.tray = QSystemTrayIcon(style.icon(False))
-                self.tray.setToolTip("Dolmetsch")
+                self.tray = QSystemTrayIcon(self.icon(False))
                 self.tray.setContextMenu(self.menu)
                 self.tray.activated.connect(lambda reason: self.toggle_window()
                                             if reason == QSystemTrayIcon.Trigger else None)
                 self.tray.show()
-
-            self.hotkeys = None
-            if use_hotkeys:
-                self.hotkeys = Hotkeys(self.cfg["hotkeys"], self.bridge.hotkey.emit)
-                self.hotkeys.start()
-                self.hotkeys.ready.wait(2)
-                if self.hotkeys.failed:
-                    self.overlay.flash("Сочетания заняты другой программой: " + ", ".join(self.hotkeys.failed)
-                                       + ". Поменяй их в config.json (меню → Папка настроек).", 20)
-
+            self.start_hotkeys()
             self.timer = QTimer(interval=30_000, timeout=self.tick)
             self.timer.start()
+            self.refresh()
             threading.Thread(target=self.load_model, name="model", daemon=True).start()
 
-        # ---------- меню
+        def icon(self, active: bool):
+            return icons.app_icon("D", tokens.DARK["accent"], active, bars=True)
+
+        # ---------- меню в трее: пять пунктов, остальное — в настройках
         def build_menu(self, QAction, QActionGroup) -> None:
             m, hk = self.menu, self.cfg["hotkeys"]
-            self.act_toggle = m.addAction(f"Старт\t{hk['toggle']}", self.toggle)
-            m.addAction(f"Показать / спрятать окно\t{hk['window']}", self.toggle_window)
-            m.addSeparator()
+            show = m.addAction(f"Показать / спрятать субтитры\t{hk['window']}", self.toggle_window)
+            m.setDefaultAction(show)                     # жирный пункт — он же левый клик по значку
+            self.act_toggle = m.addAction("", self.toggle)
             prof = m.addMenu("Профиль")
             group = QActionGroup(prof)
-            for key, title in (("auto", "Авто: в будни 9–17 «Урок», иначе «Важное»"),
-                               ("lesson", "Урок — только офлайн"), ("important", "Важное — DeepL")):
+            for key, title in (("auto", "Авто"), ("lesson", "Урок — офлайн"), ("important", "Важное — DeepL")):
+                # Qt передаёт в обработчик флажок «отмечено» — поэтому у лямбды первый параметр checked
                 act = prof.addAction(title, lambda checked=False, k=key: self.set_profile(k))
                 act.setCheckable(True)
                 act.setChecked(self.cfg["profile"] == key)
                 group.addAction(act)
             self.profile_actions = dict(zip(("auto", "lesson", "important"), group.actions()))
-            m.addAction("Ключ DeepL…", self.ask_key)
-            m.addSeparator()
-            for key, title in (("show_original", "Показывать немецкий оригинал"),
-                               ("save_transcript", "Сохранять текст встречи"),
-                               ("hide_from_capture", "Не показывать окно при демонстрации экрана"),
-                               ("autostart", "Начинать перевод при запуске")):
-                act = m.addAction(title, lambda checked=False, k=key: self.flip(k))
-                act.setCheckable(True)
-                act.setChecked(bool(self.cfg[key]))
-            size = m.addMenu("Размер шрифта")
-            size.addAction("Крупнее", lambda: self.font(+1))
-            size.addAction("Мельче", lambda: self.font(-1))
-            m.addSeparator()
-            m.addAction("Папка с текстами встреч", lambda: self.open(lessons_root()))
-            m.addAction("Папка настроек и журнала", lambda: self.open(app_dir()))
-            m.addAction("Сохранить отчёт для разбора", self.save_report)
-            m.addSeparator()
+            m.addAction("Настройки", self.open_settings)
             m.addAction("Выход", self.quit)
 
-        def open(self, path: Path) -> None:
+        # ---------- настройки
+        def open_settings(self) -> None:
+            if self.settings is None:
+                self.settings = Settings(self.cfg, {
+                    "profile": self.set_profile, "hours": self.set_hours, "key": self.save_key,
+                    "restart": self.restart, "text_px": self.set_text_px, "opacity": self.set_opacity,
+                    "redraw": self.redraw, "capture": self.apply_capture, "place": self.overlay.place,
+                    "open": self.open, "hotkeys": self.set_hotkeys, "boot": self.set_boot,
+                    "report": self.save_report, "info": self.info})
+                self.settings.setWindowIcon(self.icon(True))
+            self.settings.show()
+            self.settings.raise_()
+            self.settings.activateWindow()
+
+        def info(self) -> dict:
+            usage = ""
+            if self.online.ready():
+                usage = f"Через DeepL в этом месяце: {self.router.chars_this_month():,} символов.".replace(",", " ")
+            return {"profile": self.router.profile, "has_key": self.online.ready(), "usage": usage,
+                    "terms": self.glossary.load(), "boot": win.autostart_enabled("Dolmetsch")}
+
+        def open(self, name) -> None:
+            path = {"lessons": shared.lessons_dir, "interviews": shared.interviews_dir,
+                    "bestiary": shared.bestiary_dir, "appdir": app_dir}[name]()
             path.mkdir(parents=True, exist_ok=True)
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
-        def flip(self, key: str) -> None:
-            self.cfg.set(key, not self.cfg[key])
-            if key == "show_original":
-                self.overlay.show_original = self.cfg[key]
-                self.overlay.render()
-            elif key == "hide_from_capture":
-                self.apply_capture()
-            elif key == "save_transcript" and self.pipeline is not None:
-                self.pipeline.transcript = self.transcript if self.cfg[key] else None
+        def set_text_px(self, px: int) -> None:
+            self.overlay.set_text_px(px)
+            self.cfg.set("text_px", self.overlay.text_px)
 
-        def font(self, delta: int) -> None:
-            self.overlay.set_font_size(self.overlay.font_size + delta)
-            self.cfg.set("font_size", self.overlay.font_size)
+        def set_opacity(self, value: float) -> None:
+            self.overlay.setWindowOpacity(value)
+            self.cfg.set("opacity", round(value, 2))
+
+        def redraw(self) -> None:
+            self.overlay.show_original = bool(self.cfg["show_original"])
+            self.overlay.update()
 
         def apply_capture(self) -> None:
-            for w in (self.overlay, self.askbar):
-                set_capture_hidden(w, bool(self.cfg["hide_from_capture"]))
+            for w in (self.overlay, self.askcard):
+                win.hide_from_capture(w, bool(self.cfg["hide_from_capture"]))
+
+        def set_hours(self, hours: dict) -> None:
+            self.router.lesson_hours = hours
+            self.refresh()
+
+        def set_boot(self, on: bool) -> None:
+            frozen = getattr(sys, "frozen", False)
+            win.autostart("Dolmetsch", f'"{sys.executable}"' if on and frozen else None)
+
+        # ---------- клавиши
+        def start_hotkeys(self) -> list[str]:
+            if not self.use_hotkeys:
+                return []
+            if self.hotkeys:
+                self.hotkeys.stop()
+                self.hotkeys.join(1)
+            self.hotkeys = Hotkeys(self.cfg["hotkeys"], self.bridge.hotkey.emit)
+            self.hotkeys.start()
+            self.hotkeys.ready.wait(2)
+            if self.hotkeys.failed:
+                self.overlay.flash("Сочетания заняты другой программой: " + ", ".join(self.hotkeys.failed)
+                                   + ". Поменяй их в настройках.", 20)
+            return self.hotkeys.failed
+
+        def set_hotkeys(self, combos: dict) -> str:
+            bad = [c for c in combos.values() if parse(c) is None]
+            if bad:
+                return "Не понял: " + ", ".join(bad) + ". Пример: Win+Alt+J."
+            if len(set(c.lower() for c in combos.values())) < len(combos):
+                return "Сочетания должны быть разными."
+            self.cfg.set("hotkeys", dict(combos))
+            failed = self.start_hotkeys()
+            self.refresh()
+            return ("Заняты другой программой: " + ", ".join(failed)) if failed else "Клавиши сохранены."
 
         # ---------- профиль и ключ
         def set_profile(self, profile: str, save: bool = True) -> None:
             self.router.profile = profile
-            if save:                         # из меню — запоминаем; с клавиши — только до перезапуска
+            if save:                         # из меню и настроек — запоминаем; с клавиши — только до перезапуска
                 self.cfg.set("profile", profile)
             self.profile_actions[profile].setChecked(True)
-            active = self.router.active_profile()
-            note = f"Профиль: «{PROFILE_NAMES[active]}»"
+            note = f"Профиль: «{PROFILE_NAMES[self.router.active_profile()]}»"
             if profile == "important" and not self.online.ready():
-                note += ". Ключа DeepL нет — пока перевожу офлайн (меню → Ключ DeepL)."
+                note += ". Ключа DeepL нет — пока перевожу офлайн (Настройки → Ключ DeepL)."
             self.overlay.flash(note, 6)
             self.refresh()
 
-        def ask_key(self) -> None:
-            key, ok = QInputDialog.getText(None, "Ключ DeepL", "Ключ DeepL API (хранится в Windows, в файлы не пишется).\n"
-                                           "Пустая строка — удалить ключ.", QLineEdit.Password)
-            if not ok:
-                return
+        def save_key(self, key: str) -> str:
             if not set_deepl_key(key):
-                return self.overlay.flash("Не получилось сохранить ключ в хранилище Windows.", 10)
+                return "Не получилось сохранить ключ в хранилище Windows."
             if not key.strip():
-                return self.overlay.flash("Ключ DeepL удалён.", 6)
+                return "Ключ DeepL удалён."
             try:
                 used, limit = self.online.usage()
                 self.router.state.pop("blocked_month", None)
-                self.overlay.flash(f"Ключ принят. В этом месяце использовано {used:,} из {limit:,} символов."
-                                   .replace(",", " "), 12)
+                return f"Ключ принят. Использовано {used:,} из {limit:,} символов.".replace(",", " ")
             except Exception as e:  # noqa: BLE001
-                self.overlay.flash(f"Ключ сохранён, но проверка не прошла: {e}", 12)
+                return f"Ключ сохранён, но проверка не прошла: {e}"
 
         # ---------- старт и стоп
         def load_model(self) -> None:
@@ -255,28 +292,30 @@ def make_controller():
                 return
             self.running = True
             self.source, self.status, self.engine = "", "no_window", ""
+            self.transcript.kind = self.router.active_profile()      # «Урок» → Уроки, «Важное» → Собеседования
             self.pipeline = Pipeline(
                 self.router, on_line=self.bridge.line.emit, on_partial=self.bridge.partial.emit,
                 on_draft=self.bridge.draft.emit,
                 transcript=self.transcript if self.cfg["save_transcript"] else None,
                 live_interval=self.draft_interval())
             self.pipeline.start()
+            mode = self.cfg["source"]
 
             def make_selector(auto):
                 return Selector(TeamsSource(auto=auto), WindowsCaptionsSource(auto=auto),
                                 on_event=self.pipeline.push, on_state=self.bridge.state.emit,
-                                on_ask=self.bridge.ask.emit)
+                                on_ask=self.bridge.ask.emit, mode=mode)
 
             self.capture = CaptureLoop(make_selector, on_error=lambda text: log.warning("%s", text))
             self.capture.start()
-            log.info("старт: профиль %s", self.router.active_profile())
+            log.info("старт: профиль %s, источник %s", self.router.active_profile(), mode)
             self.refresh()
 
         def stop(self) -> None:
             if not self.running:
                 return
             self.running = False
-            self.askbar.hide()
+            self.askcard.dismiss()
             for worker in (self.capture, self.pipeline):
                 worker.stop()
             for worker in (self.capture, self.pipeline):
@@ -286,9 +325,15 @@ def make_controller():
             path = self.transcript.close()
             self.overlay.set_partial("", "")
             if path:
-                self.overlay.flash(f"Текст встречи сохранён: {path.parent.name}", 10)
+                self.overlay.flash(f"Текст встречи сохранён: {path.parent.parent.name}\\{path.parent.name}", 10)
             self.cfg.save()                  # счётчик символов DeepL
             self.refresh()
+
+        def restart(self) -> None:
+            """Применить новый источник субтитров, не закрывая программу."""
+            if self.running:
+                self.stop()
+                self.start()
 
         def toggle(self) -> None:
             self.stop() if self.running else self.start()
@@ -307,6 +352,8 @@ def make_controller():
 
         def on_line(self, line) -> None:
             self.engine, self.ms = line.engine or self.engine, line.ms
+            if self.cfg["show_terms"]:
+                line.hints = self.glossary.hints(line.text)
             self.overlay.add_line(line)
             if self.transcript.error:
                 self.overlay.flash(self.transcript.error, 10)
@@ -316,7 +363,7 @@ def make_controller():
             self.source, self.status = source, status
             selector = self.capture.selector if self.capture else None
             if status == "ok":
-                self.askbar.hide()
+                self.askcard.dismiss()
                 if selector and source == "Teams":
                     self.transcript.set_title(selector.teams.title)
             log.info("источник: %s / %s", source or "-", status)
@@ -324,8 +371,7 @@ def make_controller():
 
         def on_ask(self) -> None:
             selector = self.capture.selector if self.capture else None
-            teams_running = bool(selector and selector.teams.status != "no_window")
-            self.askbar.ask(self.overlay, teams_running)
+            self.askcard.ask(bool(selector and selector.teams.status != "no_window"))
             self.apply_capture()
 
         def on_answer(self, yes: bool) -> None:
@@ -346,10 +392,12 @@ def make_controller():
             if not self.running:
                 text = f"Пауза — {self.cfg['hotkeys']['toggle']}, чтобы начать"
             self.overlay.set_status(text, level)
-            self.act_toggle.setText(("Стоп" if self.running else "Старт") + f"\t{self.cfg['hotkeys']['toggle']}")
+            self.overlay.set_running(self.running)
+            self.act_toggle.setText(("Пауза перевода" if self.running else "Начать перевод")
+                                    + f"\t{self.cfg['hotkeys']['toggle']}")
             if self.tray:
-                self.tray.setIcon(style.icon(self.running))
-                self.tray.setToolTip(f"Dolmetsch — {text}")
+                self.tray.setIcon(self.icon(self.running))
+                self.tray.setToolTip(f"Dolmetsch — {text}"[:120])
 
         def log_reads(self) -> None:
             """В журнал: сколько миллисекунд занимает одно чтение субтитров (только числа)."""
@@ -362,6 +410,7 @@ def make_controller():
                      ms[len(ms) // 2], ms[min(len(ms) - 1, int(len(ms) * 0.95))])
 
         def tick(self) -> None:
+            self.glossary.load()             # бестиарий перечитывается, если файлы в общей папке изменились
             if self.running:
                 self.log_reads()
                 self.refresh()
@@ -379,7 +428,7 @@ def make_controller():
                         args = argparse.Namespace(snapshots=3, pause=10, max_nodes=8000, max_depth=70,
                                                   show_text=False, also=["livecaptions.exe"])
                         dump = uia_dump.run(auto, args, app_dir(), log=lambda *a: None)
-                    out = documents_dir() / f"Dolmetsch-отчёт-{time.strftime('%Y%m%d-%H%M')}.zip"
+                    out = shared.documents_dir() / f"Dolmetsch-отчёт-{time.strftime('%Y%m%d-%H%M')}.zip"
                     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
                         for f in [dump, app_dir() / "dolmetsch.log", app_dir() / "config.json"]:
                             if f and Path(f).exists():
@@ -400,7 +449,6 @@ def make_controller():
                 self.tray.hide()
             QApplication.quit()
 
-    _ = QCursor                                # (импорт нужен PyInstaller: меню открывается у курсора)
     return Controller
 
 
@@ -424,15 +472,24 @@ def smoke(report) -> int:
         from PySide6.QtWidgets import QApplication
 
         from .pipeline import Line
+        from .ui.family import tokens
         app = QApplication.instance() or QApplication([])
+        tokens.apply_app_style(app)
         controller = make_controller()(use_hotkeys=False)
         controller.overlay.show()
         controller.overlay.add_line(Line("Тест", "Guten Morgen zusammen.", "Всем доброе утро.", "офлайн", 120))
         controller.overlay.set_partial("Тест", "Wir fangen heute mit")
-        controller.askbar.ask(controller.overlay, True)
+        controller.askcard.ask(True)
+        controller.open_settings()
         QTimer.singleShot(1500, app.quit)
         app.exec()
-        report("OK   окно и меню")
+        from .ui.family import icons
+        image = icons.pixmap("settings", "#ffffff").toImage()
+        drawn = any(image.pixelColor(x, y).alpha() > 0 for x in range(0, image.width(), 2) for y in range(0, image.height(), 2))
+        if not drawn:
+            failed += 1
+        report(f"{'OK  ' if drawn else 'FAIL'} значки (SVG) {'рисуются' if drawn else 'не рисуются'}")
+        report(f"OK   окно, карточка, настройки; стиль {app.style().name()}")
     except Exception as e:  # noqa: BLE001
         failed += 1
         report(f"FAIL окно: {type(e).__name__}: {e}")
@@ -498,6 +555,8 @@ def main(argv=None) -> int:
     from PySide6.QtWidgets import QApplication, QMessageBox
     app = QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)
+    from .ui.family import tokens
+    tokens.apply_app_style(app)
     lock = QLockFile(str(app_dir() / "dolmetsch.lock"))
     if not lock.tryLock(200):
         QMessageBox.information(None, "Dolmetsch", "Dolmetsch уже запущен — значок рядом с часами.")

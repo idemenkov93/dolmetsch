@@ -3,7 +3,9 @@ name: Dolmetsch
 
 on:
   push:
-    branches: [dolmetsch, main]
+    branches: [main]
+  release:
+    types: [published]          # опубликовал релиз — архив с программой сам прикрепится к нему
   workflow_dispatch:
 
 concurrency:
@@ -11,7 +13,7 @@ concurrency:
   cancel-in-progress: true
 
 permissions:
-  contents: read
+  contents: write               # нужно, чтобы прикрепить архив к релизу
 
 env:
   MODEL_ID: Helsinki-NLP/opus-mt-tc-big-de-zle
@@ -149,3 +151,14 @@ jobs:
             smoke.txt
             probe.txt
             pytest.txt
+
+      - name: Attach to release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "Dolmetsch-${{ steps.v.outputs.version }}-win64.zip"
+          Compress-Archive -Path dist\Dolmetsch -DestinationPath $zip
+          gh release upload "${{ github.event.release.tag_name }}" $zip --clobber --repo "${{ github.repository }}"
+

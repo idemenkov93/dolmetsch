@@ -14,13 +14,14 @@ DEFAULTS = {
     },
     "profile": "auto",              # auto | lesson | important
     "lesson_hours": {"days": [0, 1, 2, 3, 4], "from": 9, "to": 17},   # будни 9–17 — профиль «Урок»
+    "source": "auto",               # откуда текст: auto | teams | windows
     "autostart": True,              # начинать перевод сразу при запуске программы
-    "save_transcript": True,        # сохранять текст встречи в файл
-    "show_original": True,          # показывать немецкий оригинал под переводом
+    "save_transcript": True,        # сохранять текст встречи в общую папку
+    "show_original": True,          # немецкий оригинал под переводом
+    "show_terms": True,             # термины из бестиария под переводом
     "hide_from_capture": True,      # не показывать окно при демонстрации экрана
-    "font_size": 15,
-    "opacity": 0.9,
-    "lines": 3,                     # сколько последних переводов держать в окне
+    "text_px": 22,                  # размер текущего перевода: 18 / 20 / 22 / 24 / 28
+    "opacity": 1.0,                 # непрозрачность окна целиком (0.6–1.0)
     "window": None,                 # положение и размер окна: [x, y, ширина, высота]
     "device": "auto",               # auto | cpu | cuda
     "threads": 0,                   # 0 = половина потоков процессора

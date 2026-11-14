@@ -10,7 +10,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 from .capture.base import Event
@@ -27,6 +27,7 @@ class Line:
     engine: str
     ms: int             # от «предложение готово» до «перевод получен»
     error: str = ""
+    hints: list = field(default_factory=list)   # термины бестиария во фразе: [(немецкий, русский)]
 
 
 class Pipeline(threading.Thread):

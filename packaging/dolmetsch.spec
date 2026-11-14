@@ -15,9 +15,11 @@ def safe(fn, *a, **k):
         return []
 
 
-datas, binaries, hidden = [], [], ["keyring.backends.Windows"]
+datas, binaries, hidden = [], [], ["keyring.backends.Windows", "PySide6.QtSvg"]
 for pkg in ("uiautomation", "certifi"):
     datas += safe(collect_data_files, pkg)
+# значки окна (SVG) лежат внутри пакета
+datas += [(os.path.join(ROOT, "dolmetsch", "ui", "family", "icons"), os.path.join("dolmetsch", "ui", "family", "icons"))]
 for pkg in ("ctranslate2", "uiautomation", "sentencepiece"):
     binaries += safe(collect_dynamic_libs, pkg)
 for pkg in ("dolmetsch", "comtypes", "win32ctypes", "keyring", "uiautomation", "truststore"):

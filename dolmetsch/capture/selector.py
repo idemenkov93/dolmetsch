@@ -30,8 +30,9 @@ class Selector:
 
     def __init__(self, teams, windows, on_event: Callable[[Event], None],
                  on_state: Callable[[str, str], None] = lambda source, status: None,
-                 on_ask: Callable[[], None] = lambda: None):
+                 on_ask: Callable[[], None] = lambda: None, mode: str = "auto"):
         self.teams, self.windows = teams, windows
+        self.mode = mode                    # auto | teams (только Teams, не спрашивать) | windows (только субтитры Windows)
         self.on_event, self.on_state, self.on_ask = on_event, on_state, on_ask
         self.active = None                  # источник, с которым работаем сейчас
         self.asked = self.declined = False
@@ -67,8 +68,17 @@ class Selector:
         if self._next_search is not None and now < self._next_search:
             return
         self._next_search = now + SEARCH_EVERY
+        if self.mode == "windows":          # выбраны субтитры Windows: Teams не трогаем, окно открываем сами
+            if self.windows.find():
+                return self._use(self.windows, now)
+            if not self.want_windows:
+                self.want_windows = True
+                self.windows.launch()
+            return self._set_state("", self.windows.status)
         if self.teams.find():
             return self._use(self.teams, now)
+        if self.mode == "teams":
+            return self._set_state("", self.teams.status)
         if self.windows.find():
             return self._use(self.windows, now)
         self._set_state("", self.teams.status)
@@ -96,7 +106,7 @@ class Selector:
             self._last_text = now
             self.on_event(ev)
         self.interval = FAST if now - self._last_text < QUIET_AFTER else SLOW
-        if self.active is self.windows and now >= self._next_teams:
+        if self.active is self.windows and self.mode == "auto" and now >= self._next_teams:
             self._next_teams = now + RECHECK_TEAMS
             if self.teams.find():           # в Teams появились субтитры — там есть имена
                 self._use(self.teams, now)

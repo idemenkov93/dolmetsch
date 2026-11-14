@@ -1,39 +1,16 @@
 """Текст встречи: пишется в файл по ходу, строка за строкой (сбой не теряет написанное).
 
 Формат и папка — как у Capri, чтобы она могла сделать конспект и пополнить бестиарий:
-    Документы\\Capri\\Уроки\\2026-11-14 0900 — Тема\\транскрипт.md
-Папки Capri нет — пишем в Документы\\Dolmetsch\\.
+    Документы\\Capri\\Уроки\\2026-11-14 0900 — Тема\\транскрипт.md          (профиль «Урок»)
+    Документы\\Capri\\Собеседования\\2026-11-14 1400 — Тема\\транскрипт.md  (профиль «Важное»)
 """
 from __future__ import annotations
 
-import ctypes
 import datetime as dt
-import os
 import re
 from pathlib import Path
 
-
-def documents_dir() -> Path:
-    """Папка «Документы» (у Игоря она в OneDrive — спрашиваем у Windows, а не гадаем)."""
-    if os.name == "nt":
-        try:
-            class GUID(ctypes.Structure):
-                _fields_ = [("a", ctypes.c_ulong), ("b", ctypes.c_ushort), ("c", ctypes.c_ushort),
-                            ("d", ctypes.c_ubyte * 8)]
-            fid = GUID(0xFDD39AD0, 0x238F, 0x46AF, (ctypes.c_ubyte * 8)(0xAD, 0xB4, 0x6C, 0x85, 0x48, 0x03, 0x69, 0xC7))
-            out = ctypes.c_wchar_p()
-            if ctypes.windll.shell32.SHGetKnownFolderPath(ctypes.byref(fid), 0, None, ctypes.byref(out)) == 0:
-                path = Path(out.value)
-                ctypes.windll.ole32.CoTaskMemFree(out)
-                return path
-        except Exception:  # noqa: BLE001
-            pass
-    return Path.home() / "Documents"
-
-
-def lessons_root(docs: Path | None = None) -> Path:
-    docs = docs or documents_dir()
-    return docs / "Capri" / "Уроки" if (docs / "Capri").exists() else docs / "Dolmetsch"
+from . import shared
 
 
 def _stamp(seconds: float) -> str:
@@ -44,6 +21,7 @@ def _stamp(seconds: float) -> str:
 class Transcript:
     def __init__(self, root: Path | None = None, now=dt.datetime.now):
         self.root, self.now = root, now
+        self.kind = "lesson"                 # lesson → Уроки, important → Собеседования
         self.path: Path | None = None
         self.started: dt.datetime | None = None
         self.title = ""
@@ -57,7 +35,7 @@ class Transcript:
 
     def _open(self) -> None:
         self.started = self.now()
-        root = self.root or lessons_root()
+        root = self.root or shared.meeting_dir(self.kind)
         name = f"{self.started:%Y-%m-%d %H%M}" + (f" — {self.title}" if self.title else "")
         folder, n = root / name, 2
         while (folder / "транскрипт.md").exists():
