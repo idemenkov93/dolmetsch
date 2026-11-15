@@ -99,7 +99,7 @@ def make_controller():
             self.transcript = Transcript()
             self.glossary = Glossary()
             self.glossary.load()
-            self.running = False
+            self.running = self.closed = False
             self.pipeline = self.capture = self.settings = None
             self.source, self.status, self.engine, self.ms = "", "no_window", "", 0
             self.use_hotkeys, self.hotkeys = use_hotkeys, None
@@ -268,10 +268,15 @@ def make_controller():
                 self.offline.load()
                 log.info("модель: устройство %s, железо класса %s (видеопамять %.1f ГБ, потоков %d)",
                          self.offline.used_device, self.hw.cls, self.hw.vram_gb, self.hw.threads)
-                self.bridge.model.emit("")
+                error = ""
             except Exception as e:  # noqa: BLE001
                 log.error("модель: %s", e)
-                self.bridge.model.emit(str(e))
+                error = str(e)
+            if not self.closed:              # программу могли закрыть, пока модель грузилась
+                try:
+                    self.bridge.model.emit(error)
+                except RuntimeError:
+                    pass
 
         def draft_interval(self):
             """Черновой перевод недописанной фразы — только когда модель работает на видеокарте."""
@@ -337,6 +342,19 @@ def make_controller():
 
         def toggle(self) -> None:
             self.stop() if self.running else self.start()
+
+        def on_command(self, command: str) -> None:
+            """Команда от второго запуска программы (см. ipc.py) — например, от Capri."""
+            if command == "show":
+                self.overlay.show()
+            elif command == "toggle":
+                self.toggle()
+            elif command == "start":
+                self.start()
+            elif command == "stop":
+                self.stop()
+            if command != "stop":
+                self.overlay.show()
 
         def toggle_window(self) -> None:
             self.overlay.setVisible(not self.overlay.isVisible())
@@ -440,13 +458,24 @@ def make_controller():
 
             threading.Thread(target=work, name="report", daemon=True).start()
 
-        def quit(self) -> None:
+        def shutdown(self) -> None:
+            """Остановить всё и убрать окна. Порядок важен: сначала потоки и таймеры, потом окна."""
             self.stop()
+            self.closed = True
+            self.timer.stop()
             if self.hotkeys:
                 self.hotkeys.stop()
             self.cfg.save()
             if self.tray:
                 self.tray.hide()
+                self.tray.deleteLater()
+            for w in (self.askcard, self.settings, self.overlay, self.menu):
+                if w is not None:
+                    w.close()
+                    w.deleteLater()
+
+        def quit(self) -> None:
+            self.shutdown()
             QApplication.quit()
 
     return Controller
@@ -530,6 +559,9 @@ def main(argv=None) -> int:
     parser.add_argument("--bench", action="store_true", help="замерить скорость офлайн-перевода")
     parser.add_argument("--probe", type=float, metavar="СЕКУНД", help="проверить захват субтитров без окна")
     parser.add_argument("--out", metavar="ФАЙЛ", help="куда записать отчёт служебного режима")
+    parser.add_argument("--toggle", action="store_true", help="старт / стоп перевода (если программа уже запущена — в ней)")
+    parser.add_argument("--start", action="store_true", help="начать перевод")
+    parser.add_argument("--stop", action="store_true", help="остановить перевод")
     parser.add_argument("--version", action="store_true")
     try:
         args = parser.parse_args(argv)
@@ -551,24 +583,32 @@ def main(argv=None) -> int:
     from .log import crash
     sys.excepthook = lambda kind, value, tb: crash("окно", value)          # у оконной программы нет консоли —
     threading.excepthook = lambda a: crash(a.thread.name if a.thread else "поток", a.exc_value)   # сбои пишем в журнал
-    from PySide6.QtCore import QLockFile
-    from PySide6.QtWidgets import QApplication, QMessageBox
+    from PySide6.QtWidgets import QApplication
+
+    from . import ipc
     app = QApplication(sys.argv[:1])
     app.setQuitOnLastWindowClosed(False)
     from .ui.family import tokens
     tokens.apply_app_style(app)
-    lock = QLockFile(str(app_dir() / "dolmetsch.lock"))
-    if not lock.tryLock(200):
-        QMessageBox.information(None, "Dolmetsch", "Dolmetsch уже запущен — значок рядом с часами.")
+    command = "toggle" if args.toggle else "start" if args.start else "stop" if args.stop else "show"
+    if ipc.send(command):                     # программа уже запущена — передали ей команду и вышли
+        return 0
+    if command == "stop":
         return 0
     log.info("=== Dolmetsch %s ===", __version__)
     controller = make_controller()()
+    server = ipc.listen(controller.on_command)
+    try:                                      # Capri находит программу по этому файлу
+        if getattr(sys, "frozen", False):
+            (app_dir() / "path.txt").write_text(sys.executable, encoding="utf-8")
+    except OSError:
+        pass
     controller.overlay.show()
     controller.apply_capture()
-    if controller.cfg["autostart"]:
+    if controller.cfg["autostart"] or command in ("toggle", "start"):
         controller.start()
     else:
         controller.refresh()
     code = app.exec()
-    lock.unlock()
+    server.close()
     return code

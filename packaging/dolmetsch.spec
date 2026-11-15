@@ -15,7 +15,7 @@ def safe(fn, *a, **k):
         return []
 
 
-datas, binaries, hidden = [], [], ["keyring.backends.Windows", "PySide6.QtSvg"]
+datas, binaries, hidden = [], [], ["keyring.backends.Windows", "PySide6.QtSvg", "PySide6.QtNetwork"]
 for pkg in ("uiautomation", "certifi"):
     datas += safe(collect_data_files, pkg)
 # значки окна (SVG) лежат внутри пакета

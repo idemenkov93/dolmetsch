@@ -97,3 +97,16 @@ def test_source_mode_teams_never_asks():
     for now in range(0, 120, 5):
         sel.step(now)
     assert sel.active is None and not asked and w.launched == 0
+
+
+def test_second_launch_passes_command_to_running_program(qapp):
+    """Второй запуск не открывает копию, а передаёт команду первой (так Capri включает перевод)."""
+    from dolmetsch import ipc
+    got = []
+    assert not ipc.send("toggle", name="dolmetsch-test")          # никто не слушает
+    server = ipc.listen(got.append, name="dolmetsch-test")
+    assert ipc.send("toggle", name="dolmetsch-test") and ipc.send("rm -rf", name="dolmetsch-test")
+    for _ in range(20):
+        qapp.processEvents()
+    server.close()
+    assert got == ["toggle"]                                      # чужие строки не выполняются

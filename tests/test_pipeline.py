@@ -1,6 +1,8 @@
 """Конвейер, текст встречи, клавиши, окно, журнал."""
 import datetime as dt
 
+import pytest
+
 from dolmetsch.capture.base import Event
 from dolmetsch.hotkeys import parse
 from dolmetsch.pipeline import STALE, Pipeline
@@ -171,12 +173,23 @@ def test_status_text():
     assert status_text(True, "Teams", "ok", "important", "офлайн", 900, "DeepL не ответил вовремя")[1] == "warn"
 
 
+CONTROLLERS = []
+
+
 def make(tmp_path, monkeypatch):
     monkeypatch.setenv("APPDATA", str(tmp_path))
     from dolmetsch import shared
     monkeypatch.setattr(shared, "documents_dir", lambda: tmp_path / "Документы")
     from dolmetsch.app import make_controller
-    return make_controller()(use_hotkeys=False)
+    CONTROLLERS.append(make_controller()(use_hotkeys=False))
+    return CONTROLLERS[-1]
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_controllers():
+    yield
+    while CONTROLLERS:
+        CONTROLLERS.pop().shutdown()
 
 
 def test_controller_starts_and_stops_without_windows(qapp, tmp_path, monkeypatch):
@@ -201,6 +214,10 @@ def test_controller_starts_and_stops_without_windows(qapp, tmp_path, monkeypatch
     assert c.cfg["text_px"] == 24
     c.stop()
     assert not c.running and "Пауза" in c.overlay.status
+    c.on_command("toggle")                           # команда от Capri: старт
+    assert c.running
+    c.on_command("stop")
+    assert not c.running
     assert (tmp_path / "Dolmetsch" / "config.json").exists()
 
 

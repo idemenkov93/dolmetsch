@@ -123,6 +123,23 @@ def qapp():
     return QApplication.instance() or QApplication([])
 
 
+@pytest.fixture(autouse=True)
+def _close_windows():
+    """После каждого теста закрываем и удаляем окна, пока Qt ещё жив.
+    Иначе они удаляются при выходе из Python в случайном порядке, и процесс иногда падает."""
+    yield
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QApplication
+    app = QApplication.instance()
+    if app is None:
+        return
+    for w in app.topLevelWidgets():
+        w.close()
+        w.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+    app.processEvents()
+
+
 _status = {"code": 0}
 
 
