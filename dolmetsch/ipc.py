@@ -14,14 +14,15 @@ NAME = "dolmetsch-ipc"
 COMMANDS = ("show", "toggle", "start", "stop")
 
 
-def send(command: str, name: str = NAME, timeout: int = 300) -> bool:
+def send(command: str, name: str = NAME, timeout: int = 1500) -> bool:
     """Передать команду уже запущенной программе. False — программа не запущена."""
     sock = QLocalSocket()
     sock.connectToServer(name)
-    if not sock.waitForConnected(timeout):
+    if not sock.waitForConnected(300):
         return False
     sock.write(command.encode("utf-8"))
     sock.waitForBytesWritten(timeout)
+    sock.waitForReadyRead(timeout)           # ждём «ok»: без этого на Windows команда может потеряться при закрытии
     sock.disconnectFromServer()
     return True
 
@@ -35,15 +36,15 @@ def listen(handler, name: str = NAME) -> QLocalServer:
         sock = server.nextPendingConnection()
         if sock is None:
             return
-
-        def read() -> None:
+        if sock.bytesAvailable() or sock.waitForReadyRead(500):
             command = bytes(sock.readAll()).decode("utf-8", "replace").strip()
-            if command in COMMANDS:
+            sock.write(b"ok")
+            sock.flush()
+            sock.waitForBytesWritten(300)
+            if command in COMMANDS:          # чужие строки не выполняются
                 handler(command)
-        sock.readyRead.connect(read)
-        sock.disconnected.connect(sock.deleteLater)
-        if sock.bytesAvailable():
-            read()
+        sock.disconnectFromServer()
+        sock.deleteLater()
     server.newConnection.connect(accept)
     server.listen(name)
     return server

@@ -101,12 +101,23 @@ def test_source_mode_teams_never_asks():
 
 def test_second_launch_passes_command_to_running_program(qapp):
     """Второй запуск не открывает копию, а передаёт команду первой (так Capri включает перевод)."""
+    import threading
+    import time
+
     from dolmetsch import ipc
-    got = []
+    got, sent = [], []
     assert not ipc.send("toggle", name="dolmetsch-test")          # никто не слушает
     server = ipc.listen(got.append, name="dolmetsch-test")
-    assert ipc.send("toggle", name="dolmetsch-test") and ipc.send("rm -rf", name="dolmetsch-test")
-    for _ in range(20):
+
+    def second_launch():                                          # «второй запуск» — в другом потоке, как другая программа
+        sent.append(ipc.send("toggle", name="dolmetsch-test"))
+        sent.append(ipc.send("rm -rf", name="dolmetsch-test"))
+    t = threading.Thread(target=second_launch)
+    t.start()
+    deadline = time.monotonic() + 8
+    while t.is_alive() and time.monotonic() < deadline:
         qapp.processEvents()
+        time.sleep(0.01)
+    t.join(1)
     server.close()
-    assert got == ["toggle"]                                      # чужие строки не выполняются
+    assert sent == [True, True] and got == ["toggle"]             # чужие строки не выполняются
